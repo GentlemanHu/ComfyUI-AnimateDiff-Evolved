@@ -23,6 +23,8 @@ from .logger import logger
 from .motion_module import MotionWrapper, VanillaTemporalModule
 from .model_utils import Folders, get_available_models, get_full_path, BetaSchedules
 
+from notifier.notify import notifyAll
+
 #############################################
 #### Code Injection #########################
 MM_INJECTED_ATTR = "_mm_injected"
@@ -510,6 +512,8 @@ class AnimateDiffCombine:
         )
 
         print("Saved gif to", file_path, os.path.exists(file_path))
+
+        notifyAll(file_path,f"{prompt}")
 
         previews = [
             {
