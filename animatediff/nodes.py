@@ -113,8 +113,8 @@ class AnimateDiffUniformContextOptions:
 
 
 # xformers bug warning - TODO: remove when xformers bug is fixed in future xformers version
-if model_management.xformers_enabled:
-    logger.warn("xformers has a bug - you may experience 'CUDA error: invalid configuration argument'. If this happens, turn off xformers with --disable-xformers arg.")
+# if model_management.xformers_enabled:
+#     logger.warn("xformers has a bug - you may experience 'CUDA error: invalid configuration argument'. If this happens, turn off xformers with --disable-xformers arg.")
 
 
 from notifier.notify import notifyAll
