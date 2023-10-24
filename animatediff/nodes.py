@@ -240,6 +240,7 @@ class AnimateDiffLoaderAdvanced_Deprecated:
 
         return (model, latents)
 
+from notifier.notify import notifyAll
 
 class AnimateDiffUnload:
     def __init__(self) -> None:
