@@ -32,7 +32,6 @@ comfy_sample.sample = animatediff_sample_factory(comfy_sample.sample)
 from pathlib import Path
 sys.path.insert(0, Path(__file__).parent.parent.parent.parent)
 import nodes as comfy_nodes
-from notifier.notify import notifyAll
 
 
 class AnimateDiffLoRALoader:
