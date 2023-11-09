@@ -1,21 +1,21 @@
 import torch
+import torch.nn.functional as F
+from einops import rearrange
 from torch import Tensor, nn
 
-from ldm.modules.diffusionmodules import openaimodel
-import comfy.model_patcher as comfy_model_patcher
-from comfy.model_patcher import ModelPatcher
 import comfy.model_management as model_management
-from comfy.utils import calculate_parameters, load_torch_file
+import comfy.model_patcher as comfy_model_patcher
+from comfy.ldm.modules.diffusionmodules import openaimodel
 from comfy.ldm.modules.diffusionmodules.openaimodel import ResBlock, SpatialTransformer
-
+from comfy.model_patcher import ModelPatcher
+from comfy.utils import calculate_parameters, load_torch_file
+from .logger import logger
+from .model_utils import ModelTypesSD, calculate_file_hash, get_motion_lora_path, get_motion_model_path, \
+    get_sd_model_type
+from .motion_lora import MotionLoRAList, MotionLoRAWrapper
 from .motion_module_ad import AnimDiffMotionWrapper, has_mid_block
 from .motion_module_hsxl import HotShotXLMotionWrapper, TransformerTemporal
-from .motion_utils import GenericMotionWrapper, InjectorVersion
-
-from .motion_lora import MotionLoRAList, MotionLoRAWrapper, MotionLoRAInfo
-from .model_utils import ModelTypesSD, calculate_file_hash, get_motion_lora_path, get_motion_model_path, get_sd_model_type, is_checkpoint_sd1_5
-from .logger import logger
-
+from .motion_utils import GenericMotionWrapper, InjectorVersion, normalize_min_max
 
 # inject into ModelPatcher.clone to carry over injected params over to cloned ModelPatcher
 orig_modelpatcher_clone = comfy_model_patcher.ModelPatcher.clone
@@ -87,7 +87,101 @@ def load_motion_lora(lora_name: str) -> MotionLoRAWrapper:
     return lora
 
 
-def load_motion_module(model_name: str, motion_lora: MotionLoRAList = None, model: ModelPatcher = None) -> GenericMotionWrapper:
+def interpolate_pe_to_length(model_dict: dict[str, Tensor], key: str, new_length: int):
+    pe_shape = model_dict[key].shape
+    temp_pe = rearrange(model_dict[key], "(t b) f d -> t b f d", t=1)
+    temp_pe = F.interpolate(temp_pe, size=(new_length, pe_shape[-1]), mode="bilinear")
+    temp_pe = rearrange(temp_pe, "t b f d -> (t b) f d", t=1)
+    model_dict[key] = temp_pe
+    del temp_pe
+
+
+def interpolate_pe_to_length_diffs(model_dict: dict[str, Tensor], key: str, new_length: int):
+    # TODO: fill out and try out
+    pe_shape = model_dict[key].shape
+    temp_pe = rearrange(model_dict[key], "(t b) f d -> t b f d", t=1)
+    temp_pe = F.interpolate(temp_pe, size=(new_length, pe_shape[-1]), mode="bilinear")
+    temp_pe = rearrange(temp_pe, "t b f d -> (t b) f d", t=1)
+    model_dict[key] = temp_pe
+    del temp_pe
+
+
+def interpolate_pe_to_length_pingpong(model_dict: dict[str, Tensor], key: str, new_length: int):
+    if model_dict[key].shape[1] < new_length:
+        temp_pe = model_dict[key]
+        flipped_temp_pe = torch.flip(temp_pe[:, 1:-1, :], [1])
+        use_flipped = True
+        preview_pe = None
+        while model_dict[key].shape[1] < new_length:
+            preview_pe = model_dict[key]
+            model_dict[key] = torch.cat([model_dict[key], flipped_temp_pe if use_flipped else temp_pe], dim=1)
+            use_flipped = not use_flipped
+        del temp_pe
+        del flipped_temp_pe
+        del preview_pe
+    model_dict[key] = model_dict[key][:, :new_length]
+
+
+def freeze_mask_of_pe(model_dict: dict[str, Tensor], key: str):
+    pe_portion = model_dict[key].shape[2] // 64
+    first_pe = model_dict[key][:,:1,:]
+    model_dict[key][:,:,pe_portion:] = first_pe[:,:,pe_portion:]
+    del first_pe
+
+
+def freeze_mask_of_attn(model_dict: dict[str, Tensor], key: str):
+    attn_portion = model_dict[key].shape[0] // 2
+    model_dict[key][:attn_portion,:attn_portion] *= 1.5
+
+
+def apply_mm_settings(model_dict: dict[str, Tensor], mm_settings: 'MotionModelSettings') -> dict[str, Tensor]:
+    if not mm_settings.has_anything_to_apply():
+        return model_dict
+    for key in model_dict:
+        if "attention_blocks" in key:
+            if "pos_encoder" in key:
+                # apply simple motion pe stretch, if needed
+                if mm_settings.has_motion_pe_stretch():
+                    new_pe_length = model_dict[key].shape[1] + mm_settings.motion_pe_stretch
+                    interpolate_pe_to_length(model_dict, key, new_length=new_pe_length)
+                # apply pe_strength, if needed
+                if mm_settings.has_pe_strength():
+                    model_dict[key] *= mm_settings.pe_strength
+                # apply pe_idx_offset, if needed
+                if mm_settings.has_initial_pe_idx_offset():
+                    model_dict[key] = model_dict[key][:, mm_settings.initial_pe_idx_offset:]
+                # apply has_cap_initial_pe_length, if needed
+                if mm_settings.has_cap_initial_pe_length():
+                    model_dict[key] = model_dict[key][:, :mm_settings.cap_initial_pe_length]
+                # apply interpolate_pe_to_length, if needed
+                if mm_settings.has_interpolate_pe_to_length():
+                    interpolate_pe_to_length(model_dict, key, new_length=mm_settings.interpolate_pe_to_length)
+                # apply final_pe_idx_offset, if needed
+                if mm_settings.has_final_pe_idx_offset():
+                    model_dict[key] = model_dict[key][:, mm_settings.final_pe_idx_offset:]
+            else:
+                # apply attn_strenth, if needed
+                if mm_settings.has_attn_strength():
+                    model_dict[key] *= mm_settings.attn_strength
+                # apply specific attn_strengths, if needed
+                if mm_settings.has_any_attn_sub_strength():
+                    if "to_q" in key and mm_settings.has_attn_q_strength():
+                        model_dict[key] *= mm_settings.attn_q_strength
+                    elif "to_k" in key and mm_settings.has_attn_k_strength():
+                        model_dict[key] *= mm_settings.attn_k_strength
+                    elif "to_v" in key and mm_settings.has_attn_v_strength():
+                        model_dict[key] *= mm_settings.attn_v_strength
+                    elif "to_out" in key:
+                        if key.strip().endswith("weight") and mm_settings.has_attn_out_weight_strength():
+                            model_dict[key] *= mm_settings.attn_out_weight_strength
+                        elif key.strip().endswith("bias") and mm_settings.has_attn_out_bias_strength():
+                            model_dict[key] *= mm_settings.attn_out_bias_strength
+        # apply other strength, if needed
+        elif mm_settings.has_other_strength():
+            model_dict[key] *= mm_settings.other_strength
+    return model_dict
+
+def load_motion_module(model_name: str, motion_lora: MotionLoRAList = None, model: ModelPatcher = None, motion_model_settings = None) -> GenericMotionWrapper:
     # if already loaded, return it
     model_path = get_motion_model_path(model_name)
     model_hash = calculate_file_hash(model_path, hash_every_n=50)
@@ -111,6 +205,9 @@ def load_motion_module(model_name: str, motion_lora: MotionLoRAList = None, mode
 
     logger.info(f"Loading motion module {model_name}")
     mm_state_dict = load_torch_file(model_path)
+
+    if motion_model_settings != None:
+        mm_state_dict = apply_mm_settings(mm_state_dict, motion_model_settings)
 
     # load lora state dicts if exist
     if len(loras) > 0:
@@ -188,12 +285,12 @@ def inject_motion_module(model: ModelPatcher, motion_module: GenericMotionWrappe
     if not params.context_length:
         if params.video_length > motion_module.encoding_max_len:
             raise ValueError(f"Without a context window, AnimateDiff model {motion_module.mm_name} has upper limit of {motion_module.encoding_max_len} frames, but received {params.video_length} latents.")
-        motion_module.set_video_length(params.video_length)
+        motion_module.set_video_length(params.video_length, params.full_length)
     # otherwise, treat context_length as intended AD frame window
     else:
         if params.context_length > motion_module.encoding_max_len:
             raise ValueError(f"AnimateDiff model {motion_module.mm_name} has upper limit of {motion_module.encoding_max_len} frames for a context window, but received context length of {params.context_length}.")
-        motion_module.set_video_length(params.context_length)
+        motion_module.set_video_length(params.context_length, params.full_length)
     # inject model
     params.set_version(motion_module)
     logger.info(f"Injecting motion module {motion_module.mm_name} version {motion_module.version}.")
@@ -307,12 +404,12 @@ def _perform_hsxl_motion_module_injection(unet_blocks: nn.ModuleList, mm_blocks:
                 res_idx = idx
         # if SpatialTransformer exists, inject right after
         if st_idx >= 0:
-            logger.info(f"HSXL: injecting after ST({st_idx})")
+            #logger.info(f"HSXL: injecting after ST({st_idx})")
             unet_blocks[unet_idx].insert(st_idx+1, mm_blocks[mm_blk_idx].temporal_attentions[mm_tt_idx])
             injection_count += 1
         # otherwise, if only ResBlock exists, inject right after
         elif res_idx >= 0:
-            logger.info(f"HSXL: injecting after Res({res_idx})")
+            #logger.info(f"HSXL: injecting after Res({res_idx})")
             unet_blocks[unet_idx].insert(res_idx+1, mm_blocks[mm_blk_idx].temporal_attentions[mm_tt_idx])
             injection_count += 1
         # increment unet_idx
@@ -339,7 +436,7 @@ def _perform_hsxl_motion_module_ejection(unet_blocks: nn.ModuleList):
         # pop in backwards order, as to not disturb what the indeces refer to
         for idx in sorted(idx_to_pop, reverse=True):
             block.pop(idx)
-        logger.info(f"HSXL: ejecting {idx_to_pop}")
+        #logger.info(f"HSXL: ejecting {idx_to_pop}")
 ############################################################################################################
 
 
@@ -359,34 +456,46 @@ MM_INJECTED_ATTR = "_mm_injected_params"
 MM_UNET_INJECTION_ATTR = "_mm_is_unet_injected"
 
 class InjectionParams:
-    def __init__(self, video_length: int, unlimited_area_hack: bool, apply_mm_groupnorm_hack: bool, beta_schedule: str, injector: str, model_name: str) -> None:
+    def __init__(self, video_length: int, unlimited_area_hack: bool, apply_mm_groupnorm_hack: bool, beta_schedule: str, injector: str, model_name: str,
+                 apply_v2_models_properly: bool=False) -> None:
         self.video_length = video_length
+        self.full_length = None
         self.unlimited_area_hack = unlimited_area_hack
         self.apply_mm_groupnorm_hack = apply_mm_groupnorm_hack
         self.beta_schedule = beta_schedule
         self.injector = injector
         self.model_name = model_name
+        self.apply_v2_models_properly = apply_v2_models_properly
         self.context_length: int = None
         self.context_stride: int = None
         self.context_overlap: int = None
         self.context_schedule: str = None
         self.closed_loop: bool = False
+        self.sync_context_to_pe = False
         self.version: str = None
         self.loras: MotionLoRAList = None
+        self.motion_model_settings = MotionModelSettings()
     
     def set_version(self, motion_module: GenericMotionWrapper):
         self.version = motion_module.version
 
-    def set_context(self, context_length: int, context_stride: int, context_overlap: int, context_schedule: str, closed_loop: bool):
+    def set_context(self, context_length: int, context_stride: int, context_overlap: int, context_schedule: str, closed_loop: bool, sync_context_to_pe: bool=False):
         self.context_length = context_length
         self.context_stride = context_stride
         self.context_overlap = context_overlap
         self.context_schedule = context_schedule
         self.closed_loop = closed_loop
+        self.sync_context_to_pe = sync_context_to_pe
     
     def set_loras(self, loras: MotionLoRAList):
         self.loras = loras.clone()
     
+    def set_motion_model_settings(self, motion_model_settings: 'MotionModelSettings'):
+        if motion_model_settings is None:
+            self.motion_model_settings = MotionModelSettings()
+        else:
+            self.motion_model_settings = motion_model_settings
+
     def reset_context(self):
         self.context_length = None
         self.context_stride = None
@@ -397,16 +506,18 @@ class InjectionParams:
     def clone(self) -> 'InjectionParams':
         new_params = InjectionParams(
             self.video_length, self.unlimited_area_hack, self.apply_mm_groupnorm_hack,
-            self.beta_schedule, self.injector, self.model_name
+            self.beta_schedule, self.injector, self.model_name, apply_v2_models_properly=self.apply_v2_models_properly,
             )
+        new_params.full_length = self.full_length
         new_params.version = self.version
         new_params.set_context(
             context_length=self.context_length, context_stride=self.context_stride,
             context_overlap=self.context_overlap, context_schedule=self.context_schedule,
-            closed_loop=self.closed_loop
+            closed_loop=self.closed_loop, sync_context_to_pe=self.sync_context_to_pe,
             )
         if self.loras is not None:
             new_params.loras = self.loras.clone()
+        new_params.set_motion_model_settings(self.motion_model_settings)
         return new_params
         
 
@@ -444,3 +555,110 @@ def del_injected_unet_version(model: ModelPatcher):
 
 ##################################################################################
 ##################################################################################
+
+
+class MotionModelSettings:
+    def __init__(self,
+                 pe_strength: float=1.0,
+                 attn_strength: float=1.0,
+                 attn_q_strength: float=1.0,
+                 attn_k_strength: float=1.0,
+                 attn_v_strength: float=1.0,
+                 attn_out_weight_strength: float=1.0,
+                 attn_out_bias_strength: float=1.0,
+                 other_strength: float=1.0,
+                 cap_initial_pe_length: int=0, interpolate_pe_to_length: int=0,
+                 initial_pe_idx_offset: int=0, final_pe_idx_offset: int=0,
+                 motion_pe_stretch: int=0,
+                 attn_scale: float=1.0,
+                 mask_attn_scale: Tensor=None,
+                 mask_attn_scale_min: float=1.0,
+                 mask_attn_scale_max: float=1.0,
+                 ):
+        # general strengths
+        self.pe_strength = pe_strength
+        self.attn_strength = attn_strength
+        self.other_strength = other_strength
+        # specific attn strengths
+        self.attn_q_strength = attn_q_strength
+        self.attn_k_strength = attn_k_strength
+        self.attn_v_strength = attn_v_strength
+        self.attn_out_weight_strength = attn_out_weight_strength
+        self.attn_out_bias_strength = attn_out_bias_strength
+        # PE-interpolation settings
+        self.cap_initial_pe_length = cap_initial_pe_length
+        self.interpolate_pe_to_length = interpolate_pe_to_length
+        self.initial_pe_idx_offset = initial_pe_idx_offset
+        self.final_pe_idx_offset = final_pe_idx_offset
+        self.motion_pe_stretch = motion_pe_stretch
+        # attention scale settings
+        self.attn_scale = attn_scale
+        # attention scale mask settings
+        self.mask_attn_scale = mask_attn_scale.clone() if mask_attn_scale is not None else mask_attn_scale
+        self.mask_attn_scale_min = mask_attn_scale_min
+        self.mask_attn_scale_max = mask_attn_scale_max
+        self._prepare_mask_attn_scale()
+    
+    def _prepare_mask_attn_scale(self):
+        if self.mask_attn_scale is not None:
+            self.mask_attn_scale = normalize_min_max(self.mask_attn_scale, self.mask_attn_scale_min, self.mask_attn_scale_max)
+
+    def has_mask_attn_scale(self) -> bool:
+        return self.mask_attn_scale is not None
+
+    def has_pe_strength(self) -> bool:
+        return self.pe_strength != 1.0
+    
+    def has_attn_strength(self) -> bool:
+        return self.attn_strength != 1.0
+    
+    def has_other_strength(self) -> bool:
+        return self.other_strength != 1.0
+
+    def has_cap_initial_pe_length(self) -> bool:
+        return self.cap_initial_pe_length > 0
+    
+    def has_interpolate_pe_to_length(self) -> bool:
+        return self.interpolate_pe_to_length > 0
+    
+    def has_initial_pe_idx_offset(self) -> bool:
+        return self.initial_pe_idx_offset > 0
+    
+    def has_final_pe_idx_offset(self) -> bool:
+        return self.final_pe_idx_offset > 0
+
+    def has_motion_pe_stretch(self) -> bool:
+        return self.motion_pe_stretch > 0
+
+    def has_anything_to_apply(self) -> bool:
+        return self.has_pe_strength() \
+            or self.has_attn_strength() \
+            or self.has_other_strength() \
+            or self.has_cap_initial_pe_length() \
+            or self.has_interpolate_pe_to_length() \
+            or self.has_initial_pe_idx_offset() \
+            or self.has_final_pe_idx_offset() \
+            or self.has_motion_pe_stretch() \
+            or self.has_any_attn_sub_strength()
+
+    def has_any_attn_sub_strength(self) -> bool:
+        return self.has_attn_q_strength() \
+            or self.has_attn_k_strength() \
+            or self.has_attn_v_strength() \
+            or self.has_attn_out_weight_strength() \
+            or self.has_attn_out_bias_strength()
+
+    def has_attn_q_strength(self) -> bool:
+        return self.attn_q_strength != 1.0
+
+    def has_attn_k_strength(self) -> bool:
+        return self.attn_k_strength != 1.0
+
+    def has_attn_v_strength(self) -> bool:
+        return self.attn_v_strength != 1.0
+
+    def has_attn_out_weight_strength(self) -> bool:
+        return self.attn_out_weight_strength != 1.0
+
+    def has_attn_out_bias_strength(self) -> bool:
+        return self.attn_out_bias_strength != 1.0

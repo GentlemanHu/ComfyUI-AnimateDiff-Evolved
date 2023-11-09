@@ -1,30 +1,27 @@
+import math
 import sys
 from typing import Callable
+
 import torch
-from torch import Tensor
-import math
 from einops import rearrange
+from torch import Tensor
 from torch.nn.functional import group_norm
 
-from comfy.samplers import lcm
-import comfy.samplers as comfy_samplers
-import comfy.model_management as model_management
-from controlnet import ControlBase
-
-from model_patcher import ModelPatcher
-
-from comfy.ldm.modules.attention import SpatialTransformer
 import comfy.ldm.modules.diffusionmodules.openaimodel as openaimodel
 import comfy.model_management as model_management
-
-from .logger import logger
-
-from .motion_module_ad import VanillaTemporalModule
-from .motion_module import InjectionParams , eject_motion_module, inject_motion_module, inject_params_into_model, load_motion_module, unload_motion_module
-from .motion_module import is_injected_mm_params, get_injected_mm_params
-from .motion_utils import GroupNormAD
+import comfy.samplers as comfy_samplers
+import comfy.sample as comfy_sample
+import comfy.utils
+from comfy.controlnet import ControlBase
+from comfy.ldm.modules.attention import SpatialTransformer
+from comfy.model_patcher import ModelPatcher
 from .context import get_context_scheduler
 from .model_utils import BetaScheduleCache, BetaSchedules, wrap_function_to_inject_xformers_bug_info
+from .motion_module import InjectionParams, eject_motion_module, inject_motion_module, inject_params_into_model, \
+    load_motion_module, unload_motion_module
+from .motion_module import is_injected_mm_params, get_injected_mm_params
+from .motion_module_ad import AnimDiffMotionWrapper, VanillaTemporalModule
+from .motion_utils import GenericMotionWrapper, GroupNormAD
 
 
 ##################################################################################
@@ -32,6 +29,7 @@ from .model_utils import BetaScheduleCache, BetaSchedules, wrap_function_to_inje
 # Global variable to use to more conveniently hack variable access into samplers
 class AnimateDiffHelper_GlobalState:
     def __init__(self):
+        self.motion_module: GenericMotionWrapper = None
         self.reset()
     
     def reset(self):
@@ -45,6 +43,11 @@ class AnimateDiffHelper_GlobalState:
         self.context_overlap: int = None
         self.context_schedule: str = None
         self.closed_loop: bool = False
+        self.sync_context_to_pe: bool = False
+        self.sub_idxs: list = None
+        if self.motion_module is not None:
+            del self.motion_module
+            self.motion_module = None
     
     def update_with_inject_params(self, params: InjectionParams):
         self.video_length = params.video_length
@@ -53,6 +56,7 @@ class AnimateDiffHelper_GlobalState:
         self.context_overlap = params.context_overlap
         self.context_schedule = params.context_schedule
         self.closed_loop = params.closed_loop
+        self.sync_context_to_pe = params.sync_context_to_pe
 
     def is_using_sliding_context(self):
         return self.context_frames is not None
@@ -103,18 +107,31 @@ def groupnorm_mm_factory(params: InjectionParams):
 ##################################################################################
 
 
+def prepare_mask_ad(noise_mask, shape, device):
+    """ensures noise mask is of proper dimensions"""
+    noise_mask = torch.nn.functional.interpolate(noise_mask.reshape((-1, 1, noise_mask.shape[-2], noise_mask.shape[-1])), size=(shape[2], shape[3]), mode="bilinear")
+    #noise_mask = noise_mask.round()
+    noise_mask = torch.cat([noise_mask] * shape[1], dim=1)
+    noise_mask = comfy.utils.repeat_to_batch_size(noise_mask, shape[0])
+    noise_mask = noise_mask.to(device)
+    return noise_mask
+
+
 def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
     def animatediff_sample(model: ModelPatcher, *args, **kwargs):
         # check if model has params - if not, no need to do anything
         if not is_injected_mm_params(model):
             return orig_comfy_sample(model, *args, **kwargs)
         # otherwise, injection time
+        motion_module = None
+        orig_beta_cache = None
         try:
             # get params - clone to keep from resetting values on cached model
             params = get_injected_mm_params(model).clone()
             # get amount of latents passed in, and inject into model
             latents = args[-1]
             params.video_length = latents.size(0)
+            params.full_length = latents.size(0)
             model = inject_params_into_model(model, params)
             # reset global state
             ADGS.reset()
@@ -125,32 +142,46 @@ def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
             orig_groupnorm_forward = torch.nn.GroupNorm.forward # used to normalize latents to remove "flickering" of colors/brightness between frames
             orig_groupnormad_forward = GroupNormAD.forward
             orig_sampling_function = comfy_samplers.sampling_function # used to support sliding context windows in samplers
+            orig_prepare_mask = comfy_sample.prepare_mask
             # save original beta schedule settings
             orig_beta_cache = BetaScheduleCache(model)
             ##############################################
 
+            # try to load motion module
+            motion_module = load_motion_module(params.model_name, params.loras, model=model, motion_model_settings=params.motion_model_settings)
 
             ##############################################
             # Inject Functions
             openaimodel.forward_timestep_embed = forward_timestep_embed
             if params.unlimited_area_hack:
                 model_management.maximum_batch_area = unlimited_batch_area
-            torch.nn.GroupNorm.forward = groupnorm_mm_factory(params)
-            if params.apply_mm_groupnorm_hack:
-                GroupNormAD.forward = groupnorm_mm_factory(params)
+            # only apply groupnorm hack if not v2 and should not apply v2 properly
+            if not (isinstance(motion_module, AnimDiffMotionWrapper) and motion_module.version == "v2" and params.apply_v2_models_properly):
+                torch.nn.GroupNorm.forward = groupnorm_mm_factory(params)
+                if params.apply_mm_groupnorm_hack:
+                    GroupNormAD.forward = groupnorm_mm_factory(params)
             comfy_samplers.sampling_function = sliding_sampling_function
+            comfy_sample.prepare_mask = prepare_mask_ad
             ##############################################
 
-            # try to load motion module
-            motion_module = load_motion_module(params.model_name, params.loras, model=model)
             # inject motion module into unet
             inject_motion_module(model=model, motion_module=motion_module, params=params)
 
-            # apply suggested beta schedule
-            beta_schedule = BetaSchedules.to_name(params.beta_schedule)
-            model.model.register_schedule(given_betas=None, beta_schedule=beta_schedule, timesteps=1000, linear_start=0.00085, linear_end=0.012, cosine_s=8e-3)
+            # apply suggested beta schedule (model_sampling)
+            model.model.model_sampling = BetaSchedules.to_model_sampling(params.beta_schedule, model)
+
+            # apply scale multiplier, if needed
+            motion_module.set_scale_multiplier(params.motion_model_settings.attn_scale)
+
+            # apply scale mask, if needed
+            motion_module.set_masks(
+                masks=params.motion_model_settings.mask_attn_scale,
+                min_val=params.motion_model_settings.mask_attn_scale_min,
+                max_val=params.motion_model_settings.mask_attn_scale_max
+                )
 
             # handle GLOBALSTATE vars and step tally
+            ADGS.motion_module = motion_module
             ADGS.update_with_inject_params(params)
             ADGS.start_step = kwargs.get("start_step") or 0
             ADGS.current_step = ADGS.start_step
@@ -168,10 +199,13 @@ def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
         finally:
             # attempt to eject motion module
             eject_motion_module(model=model)
-            # if loras are present, remove model so it can be re-loaded next time with fresh weights
-            if motion_module.has_loras():
-                unload_motion_module(motion_module)
-                del motion_module
+            if motion_module is not None:
+                # reset motion module
+                motion_module.reset()
+                # if loras are present, remove model so it can be re-loaded next time with fresh weights
+                if motion_module.has_loras():
+                    unload_motion_module(motion_module)
+                    del motion_module
             ##############################################
             # Restoration
             model_management.maximum_batch_area = orig_maximum_batch_area
@@ -179,8 +213,10 @@ def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
             torch.nn.GroupNorm.forward = orig_groupnorm_forward
             GroupNormAD.forward = orig_groupnormad_forward
             comfy_samplers.sampling_function = orig_sampling_function
+            comfy_sample.prepare_mask = orig_prepare_mask
             # reapply previous beta schedule
-            orig_beta_cache.use_cached_beta_schedule_and_clean(model)
+            if orig_beta_cache is not None:
+                orig_beta_cache.use_cached_beta_schedule_and_clean(model)
             # reset global state
             ADGS.reset()
             ##############################################
@@ -188,34 +224,31 @@ def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
 
 
 def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
-        def get_area_and_mult(cond, x_in, timestep_in):
+        def get_area_and_mult(conds, x_in, timestep_in):
             area = (x_in.shape[2], x_in.shape[3], 0, 0)
             strength = 1.0
-            if 'timestep_start' in cond[1]:
-                timestep_start = cond[1]['timestep_start']
+
+            if 'timestep_start' in conds:
+                timestep_start = conds['timestep_start']
                 if timestep_in[0] > timestep_start:
                     return None
-            if 'timestep_end' in cond[1]:
-                timestep_end = cond[1]['timestep_end']
+            if 'timestep_end' in conds:
+                timestep_end = conds['timestep_end']
                 if timestep_in[0] < timestep_end:
                     return None
-            if 'area' in cond[1]:
-                area = cond[1]['area']
-            if 'strength' in cond[1]:
-                strength = cond[1]['strength']
-
-            adm_cond = None
-            if 'adm_encoded' in cond[1]:
-                adm_cond = cond[1]['adm_encoded']
+            if 'area' in conds:
+                area = conds['area']
+            if 'strength' in conds:
+                strength = conds['strength']
 
             input_x = x_in[:,:,area[2]:area[0] + area[2],area[3]:area[1] + area[3]]
-            if 'mask' in cond[1]:
+            if 'mask' in conds:
                 # Scale the mask to the size of the input
                 # The mask should have been resized as we began the sampling process
                 mask_strength = 1.0
-                if "mask_strength" in cond[1]:
-                    mask_strength = cond[1]["mask_strength"]
-                mask = cond[1]['mask']
+                if "mask_strength" in conds:
+                    mask_strength = conds["mask_strength"]
+                mask = conds['mask']
                 assert(mask.shape[1] == x_in.shape[2])
                 assert(mask.shape[2] == x_in.shape[3])
                 mask = mask[:,area[2]:area[0] + area[2],area[3]:area[1] + area[3]] * mask_strength
@@ -224,7 +257,7 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                 mask = torch.ones_like(input_x)
             mult = mask * strength
 
-            if 'mask' not in cond[1]:
+            if 'mask' not in conds:
                 rr = 8
                 if area[2] != 0:
                     for t in range(rr):
@@ -240,27 +273,17 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                         mult[:,:,:,area[1] - 1 - t:area[1] - t] *= ((1.0/rr) * (t + 1))
 
             conditionning = {}
-            conditionning['c_crossattn'] = cond[0]
-
-            if 'concat' in cond[1]:
-                cond_concat_in = cond[1]['concat']
-                if cond_concat_in is not None and len(cond_concat_in) > 0:
-                    cropped = []
-                    for x in cond_concat_in:
-                        cr = x[:,:,area[2]:area[0] + area[2],area[3]:area[1] + area[3]]
-                        cropped.append(cr)
-                    conditionning['c_concat'] = torch.cat(cropped, dim=1)
-
-            if adm_cond is not None:
-                conditionning['c_adm'] = adm_cond
+            model_conds = conds["model_conds"]
+            for c in model_conds:
+                conditionning[c] = model_conds[c].process_cond(batch_size=x_in.shape[0], device=x_in.device, area=area)
 
             control = None
-            if 'control' in cond[1]:
-                control = cond[1]['control']
+            if 'control' in conds:
+                control = conds['control']
 
             patches = None
-            if 'gligen' in cond[1]:
-                gligen = cond[1]['gligen']
+            if 'gligen' in conds:
+                gligen = conds['gligen']
                 patches = {}
                 gligen_type = gligen[0]
                 gligen_model = gligen[1]
@@ -278,22 +301,8 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                 return True
             if c1.keys() != c2.keys():
                 return False
-            if 'c_crossattn' in c1:
-                s1 = c1['c_crossattn'].shape
-                s2 = c2['c_crossattn'].shape
-                if s1 != s2:
-                    if s1[0] != s2[0] or s1[2] != s2[2]: #these 2 cases should not happen
-                        return False
-
-                    mult_min = lcm(s1[1], s2[1])
-                    diff = mult_min // min(s1[1], s2[1])
-                    if diff > 4: #arbitrary limit on the padding because it's probably going to impact performance negatively if it's too much
-                        return False
-            if 'c_concat' in c1:
-                if c1['c_concat'].shape != c2['c_concat'].shape:
-                    return False
-            if 'c_adm' in c1:
-                if c1['c_adm'].shape != c2['c_adm'].shape:
+            for k in c1:
+                if not c1[k].can_concat(c2[k]):
                     return False
             return True
 
@@ -322,39 +331,27 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
             c_concat = []
             c_adm = []
             crossattn_max_len = 0
-            for x in c_list:
-                if 'c_crossattn' in x:
-                    c = x['c_crossattn']
-                    if crossattn_max_len == 0:
-                        crossattn_max_len = c.shape[1]
-                    else:
-                        crossattn_max_len = lcm(crossattn_max_len, c.shape[1])
-                    c_crossattn.append(c)
-                if 'c_concat' in x:
-                    c_concat.append(x['c_concat'])
-                if 'c_adm' in x:
-                    c_adm.append(x['c_adm'])
-            out = {}
-            c_crossattn_out = []
-            for c in c_crossattn:
-                if c.shape[1] < crossattn_max_len:
-                    c = c.repeat(1, crossattn_max_len // c.shape[1], 1) #padding with repeat doesn't change result
-                c_crossattn_out.append(c)
 
-            if len(c_crossattn_out) > 0:
-                out['c_crossattn'] = torch.cat(c_crossattn_out)
-            if len(c_concat) > 0:
-                out['c_concat'] = torch.cat(c_concat)
-            if len(c_adm) > 0:
-                out['c_adm'] = torch.cat(c_adm)
+            temp = {}
+            for x in c_list:
+                for k in x:
+                    cur = temp.get(k, [])
+                    cur.append(x[k])
+                    temp[k] = cur
+
+            out = {}
+            for k in temp:
+                conds = temp[k]
+                out[k] = conds[0].concat(conds[1:])
+
             return out
 
         def calc_cond_uncond_batch(model_function, cond, uncond, x_in, timestep, max_total_area, model_options):
             out_cond = torch.zeros_like(x_in)
-            out_count = torch.ones_like(x_in)/100000.0
+            out_count = torch.ones_like(x_in) * 1e-37
 
             out_uncond = torch.zeros_like(x_in)
-            out_uncond_count = torch.ones_like(x_in)/100000.0
+            out_uncond_count = torch.ones_like(x_in) * 1e-37
 
             COND = 0
             UNCOND = 1
@@ -454,7 +451,6 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
             del out_count
             out_uncond /= out_uncond_count
             del out_uncond_count
-
             return out_cond, out_uncond
         
         # sliding_calc_cond_uncond_batch inspired by ashen's initial hack for 16-frame sliding context:
@@ -476,44 +472,58 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                 control.sub_idxs = full_idxs
                 control.full_latent_length = ADGS.video_length
                 control.context_length = ADGS.context_frames
-
+            
             def get_resized_cond(cond_in, full_idxs) -> list:
                 # reuse or resize cond items to match context requirements
                 resized_cond = []
-                # cond object is a list containing a list - outer list is irrelevant, so just loop through it
+                # cond object is a list containing a dict - outer list is irrelevant, so just loop through it
                 for actual_cond in cond_in:
-                    resized_actual_cond = []
-                    # now we are in the inner list - index 0 is tensor, index 1 is dictionary
-                    for cond_idx, cond_item in enumerate(actual_cond):
-                        if isinstance(cond_item, Tensor):
-                            # check that tensor is the expected length - x.size(0)
-                            if cond_item.size(0) == x.size(0):
-                                # if so, it's subsetting time - tell controls the expected indeces so they can handle them
-                                actual_cond_item = cond_item[full_idxs]
-                                resized_actual_cond.append(actual_cond_item)
+                    resized_actual_cond = actual_cond.copy()
+                    # now we are in the inner dict - "pooled_output" is a tensor, "control" is a ControlBase object, "model_conds" is dictionary
+                    for key in actual_cond:
+                        try:
+                            cond_item = actual_cond[key]
+                            if isinstance(cond_item, Tensor):
+                                # check that tensor is the expected length - x.size(0)
+                                if cond_item.size(0) == x.size(0):
+                                    # if so, it's subsetting time - tell controls the expected indeces so they can handle them
+                                    actual_cond_item = cond_item[full_idxs]
+                                    resized_actual_cond[key] = actual_cond_item
+                                else:
+                                    resized_actual_cond[key] = cond_item
+                            # look for control
+                            elif key == "control":
+                                control_item = cond_item
+                                if hasattr(control_item, "sub_idxs"):
+                                    prepare_control_objects(control_item, full_idxs)
+                                else:
+                                    raise ValueError(f"Control type {type(control_item).__name__} may not support required features for sliding context window; \
+                                                        use Control objects from Kosinkadink/Advanced-ControlNet nodes, or make sure Advanced-ControlNet is updated.")
+                                resized_actual_cond[key] = control_item
+                                del control_item
+                            elif isinstance(cond_item, dict):
+                                new_cond_item = cond_item.copy()
+                                # when in dictionary, look for tensors and CONDCrossAttn [comfy/conds.py] (has cond attr that is a tensor)
+                                for cond_key, cond_value in new_cond_item.items():
+                                    if isinstance(cond_value, Tensor):
+                                        if cond_value.size(0) == x.size(0):
+                                            new_cond_item[cond_key] = cond_value[full_idxs]
+                                    # if has cond that is a Tensor, check if needs to be subset
+                                    elif hasattr(cond_value, "cond") and isinstance(cond_value.cond, Tensor):
+                                        if cond_value.cond.size(0) == x.size(0):
+                                            new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond[full_idxs])
+                                resized_actual_cond[key] = new_cond_item
                             else:
-                                resized_actual_cond.append(cond_item)
-                        elif isinstance(cond_item, dict):
-                            new_cond_item = cond_item.copy()
-                            # when in dictionary, look for control and tensors
-                            for cond_key, cond_value in new_cond_item.items():
-                                if cond_key == "control":
-                                    control_item = cond_value
-                                    if hasattr(control_item, "sub_idxs"):
-                                        prepare_control_objects(control_item, full_idxs)
-                                    else:
-                                        raise ValueError(f"Control type {type(control_item).__name__} may not support required features for sliding context window; use Control objects from Kosinkadink/Advanced-ControlNet nodes.")
-                                elif isinstance(cond_value, Tensor):
-                                    if cond_value.size(0) == x.size(0):
-                                        new_cond_item[cond_key] = cond_value[full_idxs]
-                            resized_actual_cond.append(new_cond_item)
-                        else:
-                            resized_actual_cond.append(cond_item)
+                                resized_actual_cond[key] = cond_item
+                        finally:
+                            del cond_item  # just in case to prevent VRAM issues
                     resized_cond.append(resized_actual_cond)
                 return resized_cond
 
             # perform calc_cond_uncond_batch per context window
             for ctx_idxs in context_scheduler(ADGS.current_step, ADGS.total_steps, ADGS.video_length, ADGS.context_frames, ADGS.context_stride, ADGS.context_overlap, ADGS.closed_loop):
+                ADGS.sub_idxs = ctx_idxs
+                ADGS.motion_module.set_sub_idxs(ADGS.sub_idxs)  
                 # account for all portions of input frames
                 full_idxs = []
                 for n in range(axes_factor):
@@ -545,7 +555,7 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
         else:
             cond, uncond = sliding_calc_cond_uncond_batch(model_function, cond, uncond, x, timestep, max_total_area, model_options)
         if "sampler_cfg_function" in model_options:
-            args = {"cond": cond, "uncond": uncond, "cond_scale": cond_scale, "timestep": timestep}
-            return model_options["sampler_cfg_function"](args)
+            args = {"cond": x - cond, "uncond": x - uncond, "cond_scale": cond_scale, "timestep": timestep, "input": x}
+            return x - model_options["sampler_cfg_function"](args)
         else:
             return uncond + (cond - uncond) * cond_scale

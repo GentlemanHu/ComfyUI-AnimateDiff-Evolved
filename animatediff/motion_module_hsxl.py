@@ -1,15 +1,14 @@
 # original HotShotXL components adapted from https://github.com/hotshotco/Hotshot-XL/blob/main/hotshot_xl/models/transformer_temporal.py
-from typing import Optional
+import math
+from typing import Iterable, Optional, Union
+
 import torch
+from einops import rearrange, repeat
 from torch import Tensor, nn
 
-import math
-from einops import rearrange, repeat
-
 from comfy.ldm.modules.attention import FeedForward
-
-from .motion_utils import GenericMotionWrapper, GroupNormAD, InjectorVersion, BlockType, CrossAttentionMM
 from .motion_lora import MotionLoRAInfo
+from .motion_utils import GenericMotionWrapper, GroupNormAD, InjectorVersion, BlockType, CrossAttentionMM, TemporalTransformerGeneric
 
 
 def zero_module(module):
@@ -45,16 +44,16 @@ def has_mid_block(mm_state_dict: dict[str, Tensor]):
 class HotShotXLMotionWrapper(GenericMotionWrapper):
     def __init__(self, mm_state_dict: dict[str, Tensor], mm_hash: str, mm_name: str="mm_sd_v15.ckpt", loras: list[MotionLoRAInfo]=None):
         super().__init__(mm_hash, mm_name, loras)
-        self.down_blocks = nn.ModuleList([])
-        self.up_blocks = nn.ModuleList([])
-        self.mid_block = None
+        self.down_blocks: Iterable[HotShotXLMotionModule] = nn.ModuleList([])
+        self.up_blocks: Iterable[HotShotXLMotionModule] = nn.ModuleList([])
+        self.mid_block: Union[HotShotXLMotionModule, None] = None
         self.encoding_max_len = get_hsxl_temporal_position_encoding_max_len(mm_state_dict, mm_name)
         for c in (320, 640, 1280):
-            self.down_blocks.append(HotShotXLMotionModule(c, block_type=BlockType.DOWN))
+            self.down_blocks.append(HotShotXLMotionModule(c, block_type=BlockType.DOWN, max_length=self.encoding_max_len))
         for c in (1280, 640, 320):
-            self.up_blocks.append(HotShotXLMotionModule(c, block_type=BlockType.UP))
+            self.up_blocks.append(HotShotXLMotionModule(c, block_type=BlockType.UP, max_length=self.encoding_max_len))
         if has_mid_block(mm_state_dict):
-            self.mid_block = HotShotXLMotionModule(1280, BlockType=BlockType.MID)
+            self.mid_block = HotShotXLMotionModule(1280, BlockType=BlockType.MID, max_length=self.encoding_max_len)
         self.mm_hash = mm_hash
         self.mm_name = mm_name
         self.version = "HSXL v1" if self.mid_block is None else "HSXL v2"
@@ -67,49 +66,98 @@ class HotShotXLMotionWrapper(GenericMotionWrapper):
         # but only after implementing a fix for lowvram loading
         return self.loras is not None
     
-    def set_video_length(self, video_length: int):
+    def set_video_length(self, video_length: int, full_length: int):
         self.AD_video_length = video_length
         for block in self.down_blocks:
-            block.set_video_length(video_length)
+            block.set_video_length(video_length, full_length)
         for block in self.up_blocks:
-            block.set_video_length(video_length)
+            block.set_video_length(video_length, full_length)
         if self.mid_block is not None:
-            self.mid_block.set_video_length(video_length)
+            self.mid_block.set_video_length(video_length, full_length)
+    
+    def set_scale_multiplier(self, multiplier: Union[float, None]):
+        for block in self.down_blocks:
+            block.set_scale_multiplier(multiplier)
+        for block in self.up_blocks:
+            block.set_scale_multiplier(multiplier)
+        if self.mid_block is not None:
+            self.mid_block.set_scale_multiplier(multiplier)
+
+    def set_masks(self, masks: Tensor, min_val: float, max_val: float):
+        for block in self.down_blocks:
+            block.set_masks(masks, min_val, max_val)
+        for block in self.up_blocks:
+            block.set_masks(masks, min_val, max_val)
+        if self.mid_block is not None:
+            self.mid_block.set_masks(masks, min_val, max_val)
+
+    def set_sub_idxs(self, sub_idxs: list[int]):
+        for block in self.down_blocks:
+            block.set_sub_idxs(sub_idxs)
+        for block in self.up_blocks:
+            block.set_sub_idxs(sub_idxs)
+        if self.mid_block is not None:
+            self.mid_block.set_sub_idxs(sub_idxs)
+    
+    def reset_temp_vars(self):
+        for block in self.down_blocks:
+            block.reset_temp_vars()
+        for block in self.up_blocks:
+            block.reset_temp_vars()
+        if self.mid_block is not None:
+            self.mid_block.reset_temp_vars()
         
 
 class HotShotXLMotionModule(nn.Module):
-    def __init__(self, in_channels, block_type: str=BlockType.DOWN):
+    def __init__(self, in_channels, block_type: str=BlockType.DOWN, max_length=24):
         super().__init__()
         if block_type == BlockType.MID:
             # mid blocks contain only a single TransformerTemporal
-            self.temporal_attentions = nn.ModuleList([get_transformer_temporal(in_channels)])
+            self.temporal_attentions: Iterable[TransformerTemporal] = nn.ModuleList([get_transformer_temporal(in_channels, max_length)])
         else:
             # down blocks contain two TransformerTemporals
             self.temporal_attentions = nn.ModuleList(
                 [
-                    get_transformer_temporal(in_channels),
-                    get_transformer_temporal(in_channels)
+                    get_transformer_temporal(in_channels, max_length),
+                    get_transformer_temporal(in_channels, max_length)
                 ]
             )
             # up blocks contain one additional TransformerTemporal
             if block_type == BlockType.UP:
-                self.temporal_attentions.append(get_transformer_temporal(in_channels))
+                self.temporal_attentions.append(get_transformer_temporal(in_channels, max_length))
 
-    def set_video_length(self, video_length: int):
+    def set_video_length(self, video_length: int, full_length: int):
         for tt in self.temporal_attentions:
-            tt.set_video_length(video_length)
+            tt.set_video_length(video_length, full_length)
+
+    def set_scale_multiplier(self, multiplier: Union[float, None]):
+        for tt in self.temporal_attentions:
+            tt.set_scale_multiplier(multiplier)
+    
+    def set_masks(self, masks: Tensor, min_val: float, max_val: float):
+        for tt in self.temporal_attentions:
+            tt.set_masks(masks, min_val, max_val)
+    
+    def set_sub_idxs(self, sub_idxs: list[int]):
+        for tt in self.temporal_attentions:
+            tt.set_sub_idxs(sub_idxs)
+
+    def reset_temp_vars(self):
+        for tt in self.temporal_attentions:
+            tt.reset_temp_vars()
 
 
-def get_transformer_temporal(in_channels) -> 'TransformerTemporal':
+def get_transformer_temporal(in_channels, max_length) -> 'TransformerTemporal':
     num_attention_heads = 8
     return TransformerTemporal(
         num_attention_heads=num_attention_heads,
         attention_head_dim=in_channels // num_attention_heads,
         in_channels=in_channels,
+        max_length=max_length,
     )
 
 
-class TransformerTemporal(nn.Module):
+class TransformerTemporal(nn.Module, TemporalTransformerGeneric):
     def __init__(
             self,
             num_attention_heads: int,
@@ -122,15 +170,17 @@ class TransformerTemporal(nn.Module):
             attention_bias: bool = False,
             activation_fn: str = "geglu",
             upcast_attention: bool = False,
+            max_length = 24,
     ):
         super().__init__()
+        super().temporal_transformer_init(default_length=8)
 
         inner_dim = num_attention_heads * attention_head_dim
 
         self.norm = GroupNormAD(num_groups=norm_num_groups, num_channels=in_channels, eps=1e-6, affine=True)
         self.proj_in = nn.Linear(in_channels, inner_dim)
 
-        self.transformer_blocks = nn.ModuleList(
+        self.transformer_blocks: Iterable[TransformerBlock] = nn.ModuleList(
             [
                 TransformerBlock(
                     dim=inner_dim,
@@ -140,25 +190,40 @@ class TransformerTemporal(nn.Module):
                     activation_fn=activation_fn,
                     attention_bias=attention_bias,
                     upcast_attention=upcast_attention,
-                    cross_attention_dim=cross_attention_dim
+                    cross_attention_dim=cross_attention_dim,
+                    max_length=max_length,
                 )
                 for _ in range(num_layers)
             ]
         )
         self.proj_out = nn.Linear(inner_dim, in_channels)
-        self.video_length = 8
 
-    def set_video_length(self, video_length: int):
+    def set_video_length(self, video_length: int, full_length: int):
         self.video_length = video_length
+        self.full_length = full_length
+
+    def set_scale_multiplier(self, multiplier: Union[float, None]):
+        for block in self.transformer_blocks:
+            block.set_scale_multiplier(multiplier)
+    
+    def set_masks(self, masks: Tensor, min_val: float, max_val: float):
+        self.scale_min = min_val
+        self.scale_max = max_val
+        self.raw_scale_mask = masks
+    
+    def set_sub_idxs(self, sub_idxs: list[int]):
+        self.sub_idxs = sub_idxs
 
     def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None):
-        batch, channel, height, weight = hidden_states.shape
+        batch, channel, height, width = hidden_states.shape
         residual = hidden_states
+
+        scale_mask = self.get_scale_mask(hidden_states)
 
         hidden_states = self.norm(hidden_states)
         inner_dim = hidden_states.shape[1]
         hidden_states = hidden_states.permute(0, 2, 3, 1).reshape(
-            batch, height * weight, inner_dim
+            batch, height * width, inner_dim
         )
         hidden_states = self.proj_in(hidden_states)
 
@@ -168,12 +233,14 @@ class TransformerTemporal(nn.Module):
                 hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
-                number_of_frames=self.video_length)
+                number_of_frames=self.video_length,
+                scale_mask=scale_mask
+            )
 
         # output
         hidden_states = self.proj_out(hidden_states)
         hidden_states = (
-            hidden_states.reshape(batch, height, weight, inner_dim)
+            hidden_states.reshape(batch, height, width, inner_dim)
             .permute(0, 3, 1, 2)
             .contiguous()
         )
@@ -194,7 +261,8 @@ class TransformerBlock(nn.Module):
             attention_bias=False,
             upcast_attention=False,
             depth=2,
-            cross_attention_dim: Optional[int] = None
+            cross_attention_dim: Optional[int] = None,
+            max_length=24
     ):
         super().__init__()
 
@@ -206,6 +274,7 @@ class TransformerBlock(nn.Module):
         for _ in range(depth):
             attention_blocks.append(
                 TemporalAttention(
+                    max_length=max_length,
                     query_dim=dim,
                     context_dim=cross_attention_dim, # called context_dim for ComfyUI impl
                     heads=num_attention_heads,
@@ -217,14 +286,17 @@ class TransformerBlock(nn.Module):
             )
             norms.append(nn.LayerNorm(dim))
 
-        self.attention_blocks = nn.ModuleList(attention_blocks)
+        self.attention_blocks: Iterable[TemporalAttention] = nn.ModuleList(attention_blocks)
         self.norms = nn.ModuleList(norms)
 
         self.ff = FeedForward(dim, dropout=dropout, glu=(activation_fn == "geglu"))
         self.ff_norm = nn.LayerNorm(dim)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, number_of_frames=None):
+    def set_scale_multiplier(self, multiplier: Union[float, None]):
+        for block in self.attention_blocks:
+            block.set_scale_multiplier(multiplier)
 
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, number_of_frames=None, scale_mask=None):
         if not self.is_cross:
             encoder_hidden_states = None
 
@@ -234,7 +306,8 @@ class TransformerBlock(nn.Module):
                 norm_hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
                 attention_mask=attention_mask,
-                number_of_frames=number_of_frames
+                number_of_frames=number_of_frames,
+                scale_mask=scale_mask
             ) + hidden_states
 
         norm_hidden_states = self.ff_norm(hidden_states)
@@ -277,11 +350,17 @@ class PositionalEncoding(nn.Module):
 
 
 class TemporalAttention(CrossAttentionMM):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, max_length=24, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.pos_encoder = PositionalEncoding(kwargs["query_dim"], dropout=0)
+        self.pos_encoder = PositionalEncoding(kwargs["query_dim"], dropout=0, max_length=max_length)
 
-    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, number_of_frames=8):
+    def set_scale_multiplier(self, multiplier: Union[float, None]):
+        if multiplier is None or math.isclose(multiplier, 1.0):
+            self.scale = None
+        else:
+            self.scale = multiplier
+
+    def forward(self, hidden_states, encoder_hidden_states=None, attention_mask=None, number_of_frames=8, scale_mask=None):
         sequence_length = hidden_states.shape[1]
         hidden_states = rearrange(hidden_states, "(b f) s c -> (b s) f c", f=number_of_frames)
         hidden_states = self.pos_encoder(hidden_states, length=number_of_frames)
@@ -289,6 +368,11 @@ class TemporalAttention(CrossAttentionMM):
         if encoder_hidden_states:
             encoder_hidden_states = repeat(encoder_hidden_states, "b n c -> (b s) n c", s=sequence_length)
 
-        hidden_states = super().forward(hidden_states, encoder_hidden_states, mask=attention_mask)
+        hidden_states = super().forward(
+            hidden_states,
+            encoder_hidden_states,
+            mask=attention_mask,
+            scale_mask=scale_mask
+        )
 
         return rearrange(hidden_states, "(b s) f c -> (b f) s c", s=sequence_length)
