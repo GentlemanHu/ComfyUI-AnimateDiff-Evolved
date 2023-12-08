@@ -1,27 +1,25 @@
-import math
-import sys
 from typing import Callable
 
+import math
 import torch
-from einops import rearrange
 from torch import Tensor
 from torch.nn.functional import group_norm
+from einops import rearrange
 
-import comfy.ldm.modules.diffusionmodules.openaimodel as openaimodel
+import comfy.ldm.modules.attention as attention
+from comfy.ldm.modules.diffusionmodules import openaimodel
 import comfy.model_management as model_management
 import comfy.samplers as comfy_samplers
 import comfy.sample as comfy_sample
 import comfy.utils
 from comfy.controlnet import ControlBase
-from comfy.ldm.modules.attention import SpatialTransformer
-from comfy.model_patcher import ModelPatcher
+
 from .context import get_context_scheduler
-from .model_utils import BetaScheduleCache, BetaSchedules, wrap_function_to_inject_xformers_bug_info
-from .motion_module import InjectionParams, eject_motion_module, inject_motion_module, inject_params_into_model, \
-    load_motion_module, unload_motion_module
-from .motion_module import is_injected_mm_params, get_injected_mm_params
-from .motion_module_ad import AnimDiffMotionWrapper, VanillaTemporalModule
-from .motion_utils import GenericMotionWrapper, GroupNormAD
+from .motion_utils import GroupNormAD, NoiseType
+from .model_utils import ModelTypeSD, wrap_function_to_inject_xformers_bug_info
+from .model_injection import InjectionParams, ModelPatcherAndInjector, MotionModelPatcher
+from .motion_module_ad import AnimateDiffFormat, AnimateDiffInfo, AnimateDiffVersion, VanillaTemporalModule
+from .logger import logger
 
 
 ##################################################################################
@@ -29,7 +27,8 @@ from .motion_utils import GenericMotionWrapper, GroupNormAD
 # Global variable to use to more conveniently hack variable access into samplers
 class AnimateDiffHelper_GlobalState:
     def __init__(self):
-        self.motion_module: GenericMotionWrapper = None
+        self.motion_model: MotionModelPatcher = None
+        self.params: InjectionParams = None
         self.reset()
     
     def reset(self):
@@ -45,9 +44,12 @@ class AnimateDiffHelper_GlobalState:
         self.closed_loop: bool = False
         self.sync_context_to_pe: bool = False
         self.sub_idxs: list = None
-        if self.motion_module is not None:
-            del self.motion_module
-            self.motion_module = None
+        if self.motion_model is not None:
+            del self.motion_model
+            self.motion_model = None
+        if self.params is not None:
+            del self.params
+            self.params = None
     
     def update_with_inject_params(self, params: InjectionParams):
         self.video_length = params.video_length
@@ -57,9 +59,20 @@ class AnimateDiffHelper_GlobalState:
         self.context_schedule = params.context_schedule
         self.closed_loop = params.closed_loop
         self.sync_context_to_pe = params.sync_context_to_pe
+        self.params = params
 
     def is_using_sliding_context(self):
         return self.context_frames is not None
+    
+    def create_exposed_params(self):
+        # This dict will be exposed to be used by other extensions
+        # DO NOT change any of the key names
+        # or I will find you 👁.👁
+        return {
+            "full_length": self.video_length,
+            "context_length": self.context_frames,
+            "sub_idxs": self.sub_idxs,
+        }
 
 ADGS = AnimateDiffHelper_GlobalState()
 ######################################################################
@@ -68,25 +81,57 @@ ADGS = AnimateDiffHelper_GlobalState()
 
 ##################################################################################
 #### Code Injection ##################################################
-def forward_timestep_embed(
-    ts, x, emb, context=None, transformer_options={}, output_shape=None
-):
-    for layer in ts:
-        if isinstance(layer, openaimodel.TimestepBlock):
-            x = layer(x, emb)
-        elif isinstance(layer, VanillaTemporalModule):
-            x = layer(x, context)
-        elif isinstance(layer, SpatialTransformer):
-            x = layer(x, context, transformer_options)
-            transformer_options["current_index"] += 1
-        elif isinstance(layer, openaimodel.Upsample):
-            x = layer(x, output_shape=output_shape)
-        else:
-            x = layer(x)
-    return x
 
-def unlimited_batch_area():
-    return int(sys.maxsize)
+# refer to forward_timestep_embed in comfy/ldm/modules/diffusionmodules/openaimodel.py
+def forward_timestep_embed_factory() -> Callable:
+    if hasattr(attention, "SpatialVideoTransformer"):
+        def forward_timestep_embed(ts, x, emb, context=None, transformer_options={}, output_shape=None, time_context=None, num_video_frames=None, image_only_indicator=None):
+            for layer in ts:
+                if isinstance(layer, openaimodel.VideoResBlock):
+                    x = layer(x, emb, num_video_frames, image_only_indicator)
+                elif isinstance(layer, openaimodel.TimestepBlock):
+                    x = layer(x, emb)
+                elif isinstance(layer, VanillaTemporalModule):
+                    x = layer(x, context)
+                elif isinstance(layer, attention.SpatialVideoTransformer):
+                    x = layer(x, context, time_context, num_video_frames, image_only_indicator, transformer_options)
+                    if "transformer_index" in transformer_options:
+                        transformer_options["transformer_index"] += 1
+                    if "current_index" in transformer_options: # keep this for backward compat, for now
+                        transformer_options["current_index"] += 1
+                elif isinstance(layer, attention.SpatialTransformer):
+                    x = layer(x, context, transformer_options)
+                    if "transformer_index" in transformer_options:
+                        transformer_options["transformer_index"] += 1
+                    if "current_index" in transformer_options:  # keep this for backward compat, for now
+                        transformer_options["current_index"] += 1
+                elif isinstance(layer, openaimodel.Upsample):
+                    x = layer(x, output_shape=output_shape)
+                else:
+                    x = layer(x)
+            return x
+    # keep old version for backwards compatibility (TODO: remove at end of 2023)
+    else:
+        def forward_timestep_embed(ts, x, emb, context=None, transformer_options={}, output_shape=None):
+            for layer in ts:
+                if isinstance(layer, openaimodel.TimestepBlock):
+                    x = layer(x, emb)
+                elif isinstance(layer, VanillaTemporalModule):
+                    x = layer(x, context)
+                elif isinstance(layer, attention.SpatialTransformer):
+                    x = layer(x, context, transformer_options)
+                    if "current_index" in transformer_options:
+                        transformer_options["current_index"] += 1
+                elif isinstance(layer, openaimodel.Upsample):
+                    x = layer(x, output_shape=output_shape)
+                else:
+                    x = layer(x)
+            return x
+    return forward_timestep_embed
+
+
+def unlimited_memory_required(*args, **kwargs):
+    return 0
 
 
 def groupnorm_mm_factory(params: InjectionParams):
@@ -103,6 +148,15 @@ def groupnorm_mm_factory(params: InjectionParams):
         input = rearrange(input, "b c f h w -> (b f) c h w", b=axes_factor)
         return input
     return groupnorm_mm_forward
+
+
+def get_additional_models_factory(orig_get_additional_models: Callable, motion_model: MotionModelPatcher):
+    def get_additional_models_with_motion(*args, **kwargs):
+        models, inference_memory = orig_get_additional_models(*args, **kwargs)
+        models.append(motion_model)
+        # TODO: account for inference memory as well?
+        return models, inference_memory
+    return get_additional_models_with_motion
 ######################################################################
 ##################################################################################
 
@@ -117,71 +171,101 @@ def prepare_mask_ad(noise_mask, shape, device):
     return noise_mask
 
 
-def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
-    def animatediff_sample(model: ModelPatcher, *args, **kwargs):
-        # check if model has params - if not, no need to do anything
-        if not is_injected_mm_params(model):
-            return orig_comfy_sample(model, *args, **kwargs)
-        # otherwise, injection time
-        motion_module = None
-        orig_beta_cache = None
+def apply_params_to_motion_model(motion_model: MotionModelPatcher, params: InjectionParams):
+    if params.context_length and params.video_length > params.context_length:
+        logger.info(f"Sliding context window activated - latents passed in ({params.video_length}) greater than context_length {params.context_length}.")
+    else:
+        logger.info(f"Regular AnimateDiff activated - latents passed in ({params.video_length}) less or equal to context_length {params.context_length}.")
+        params.reset_context()
+    # if no context_length, treat video length as intended AD frame window
+    if not params.context_length:
+        if params.video_length > motion_model.model.encoding_max_len:
+            raise ValueError(f"Without a context window, AnimateDiff model {motion_model.model.mm_info.mm_name} has upper limit of {motion_model.model.encoding_max_len} frames, but received {params.video_length} latents.")
+        motion_model.model.set_video_length(params.video_length, params.full_length)
+    # otherwise, treat context_length as intended AD frame window
+    else:
+        if params.context_length > motion_model.model.encoding_max_len:
+            raise ValueError(f"AnimateDiff model {motion_model.model.mm_info.mm_name} has upper limit of {motion_model.model.encoding_max_len} frames for a context window, but received context length of {params.context_length}.")
+        motion_model.model.set_video_length(params.context_length, params.full_length)
+    # inject model
+    logger.info(f"Using motion module {motion_model.model.mm_info.mm_name} version {motion_model.model.mm_info.mm_version}.")
+
+
+class FunctionInjectionHolder:
+    def __init__(self):
+        pass
+    
+    def inject_functions(self, model: ModelPatcherAndInjector, params: InjectionParams):
+        # Save Original Functions
+        self.orig_forward_timestep_embed = openaimodel.forward_timestep_embed # needed to account for VanillaTemporalModule
+        self.orig_memory_required = model.model.memory_required # allows for "unlimited area hack" to prevent halving of conds/unconds
+        self.orig_groupnorm_forward = torch.nn.GroupNorm.forward # used to normalize latents to remove "flickering" of colors/brightness between frames
+        self.orig_groupnormad_forward = GroupNormAD.forward
+        self.orig_sampling_function = comfy_samplers.sampling_function # used to support sliding context windows in samplers
+        self.orig_prepare_mask = comfy_sample.prepare_mask
+        self.orig_get_additional_models = comfy_sample.get_additional_models
+        # Inject Functions
+        openaimodel.forward_timestep_embed = forward_timestep_embed_factory()
+        if params.unlimited_area_hack:
+            model.model.memory_required = unlimited_memory_required
+        # only apply groupnorm hack if not [AnimateDiff SD1.5 and v2 and should apply v2 properly]
+        info: AnimateDiffInfo = model.motion_model.model.mm_info
+        if not (info.mm_format == AnimateDiffFormat.ANIMATEDIFF and info.sd_type == ModelTypeSD.SD1_5 and \
+                info.mm_version == AnimateDiffVersion.V2 and params.apply_v2_models_properly):
+            torch.nn.GroupNorm.forward = groupnorm_mm_factory(params)
+            if params.apply_mm_groupnorm_hack:
+                GroupNormAD.forward = groupnorm_mm_factory(params)
+        comfy_samplers.sampling_function = sliding_sampling_function
+        comfy_sample.prepare_mask = prepare_mask_ad
+        comfy_sample.get_additional_models = get_additional_models_factory(self.orig_get_additional_models, model.motion_model)
+        del info
+
+    def restore_functions(self, model: ModelPatcherAndInjector):
+        # Restoration
         try:
-            # get params - clone to keep from resetting values on cached model
-            params = get_injected_mm_params(model).clone()
-            # get amount of latents passed in, and inject into model
+            model.model.memory_required = self.orig_memory_required
+            openaimodel.forward_timestep_embed = self.orig_forward_timestep_embed
+            torch.nn.GroupNorm.forward = self.orig_groupnorm_forward
+            GroupNormAD.forward = self.orig_groupnormad_forward
+            comfy_samplers.sampling_function = self.orig_sampling_function
+            comfy_sample.prepare_mask = self.orig_prepare_mask
+            comfy_sample.get_additional_models = self.orig_get_additional_models
+        except AttributeError:
+            logger.error("Encountered AttributeError while attempting to restore functions - likely, an error occured while trying " + \
+                         "to save original functions before injection, and a more specific error was thrown by ComfyUI.")
+
+
+def motion_sample_factory(orig_comfy_sample: Callable) -> Callable:
+    def motion_sample(model: ModelPatcherAndInjector, noise: Tensor, *args, **kwargs):
+        # check if model is intended for injecting
+        if type(model) != ModelPatcherAndInjector:
+            return orig_comfy_sample(model, noise, *args, **kwargs)
+        # otherwise, injection time
+        latents = None
+        function_injections = FunctionInjectionHolder()
+        try:
+            # clone params from model
+            params = model.motion_injection_params.clone()
+            # get amount of latents passed in, and store in params
             latents = args[-1]
             params.video_length = latents.size(0)
             params.full_length = latents.size(0)
-            model = inject_params_into_model(model, params)
             # reset global state
             ADGS.reset()
-            ##############################################
-            # Save Original Functions
-            orig_forward_timestep_embed = openaimodel.forward_timestep_embed # needed to account for VanillaTemporalModule
-            orig_maximum_batch_area = model_management.maximum_batch_area # allows for "unlimited area hack" to prevent halving of conds/unconds
-            orig_groupnorm_forward = torch.nn.GroupNorm.forward # used to normalize latents to remove "flickering" of colors/brightness between frames
-            orig_groupnormad_forward = GroupNormAD.forward
-            orig_sampling_function = comfy_samplers.sampling_function # used to support sliding context windows in samplers
-            orig_prepare_mask = comfy_sample.prepare_mask
-            # save original beta schedule settings
-            orig_beta_cache = BetaScheduleCache(model)
-            ##############################################
+            # store and inject functions
+            function_injections.inject_functions(model, params)
 
-            # try to load motion module
-            motion_module = load_motion_module(params.model_name, params.loras, model=model, motion_model_settings=params.motion_model_settings)
+            # apply custom noise, if needed
+            disable_noise = kwargs.get("disable_noise") or False
+            seed = kwargs["seed"]
+            if not disable_noise:
+                # if context asks for specific noise, do it
+                noise = NoiseType.prepare_noise(params.noise_type, latents=latents, noise=noise, context_length=params.context_length, seed=seed)
 
-            ##############################################
-            # Inject Functions
-            openaimodel.forward_timestep_embed = forward_timestep_embed
-            if params.unlimited_area_hack:
-                model_management.maximum_batch_area = unlimited_batch_area
-            # only apply groupnorm hack if not v2 and should not apply v2 properly
-            if not (isinstance(motion_module, AnimDiffMotionWrapper) and motion_module.version == "v2" and params.apply_v2_models_properly):
-                torch.nn.GroupNorm.forward = groupnorm_mm_factory(params)
-                if params.apply_mm_groupnorm_hack:
-                    GroupNormAD.forward = groupnorm_mm_factory(params)
-            comfy_samplers.sampling_function = sliding_sampling_function
-            comfy_sample.prepare_mask = prepare_mask_ad
-            ##############################################
-
-            # inject motion module into unet
-            inject_motion_module(model=model, motion_module=motion_module, params=params)
-
-            # apply suggested beta schedule (model_sampling)
-            model.model.model_sampling = BetaSchedules.to_model_sampling(params.beta_schedule, model)
-
-            # apply scale multiplier, if needed
-            motion_module.set_scale_multiplier(params.motion_model_settings.attn_scale)
-
-            # apply scale mask, if needed
-            motion_module.set_masks(
-                masks=params.motion_model_settings.mask_attn_scale,
-                min_val=params.motion_model_settings.mask_attn_scale_min,
-                max_val=params.motion_model_settings.mask_attn_scale_max
-                )
+            # apply params to motion model
+            apply_params_to_motion_model(model.motion_model, params)
 
             # handle GLOBALSTATE vars and step tally
-            ADGS.motion_module = motion_module
             ADGS.update_with_inject_params(params)
             ADGS.start_step = kwargs.get("start_step") or 0
             ADGS.current_step = ADGS.start_step
@@ -194,36 +278,22 @@ def animatediff_sample_factory(orig_comfy_sample: Callable) -> Callable:
                 # update GLOBALSTATE for next iteration
                 ADGS.current_step = ADGS.start_step + step + 1
             kwargs["callback"] = ad_callback
+            ADGS.motion_model = model.motion_model
 
-            return wrap_function_to_inject_xformers_bug_info(orig_comfy_sample)(model, *args, **kwargs)
+            return wrap_function_to_inject_xformers_bug_info(orig_comfy_sample)(model, noise, *args, **kwargs)
         finally:
-            # attempt to eject motion module
-            eject_motion_module(model=model)
-            if motion_module is not None:
-                # reset motion module
-                motion_module.reset()
-                # if loras are present, remove model so it can be re-loaded next time with fresh weights
-                if motion_module.has_loras():
-                    unload_motion_module(motion_module)
-                    del motion_module
-            ##############################################
-            # Restoration
-            model_management.maximum_batch_area = orig_maximum_batch_area
-            openaimodel.forward_timestep_embed = orig_forward_timestep_embed
-            torch.nn.GroupNorm.forward = orig_groupnorm_forward
-            GroupNormAD.forward = orig_groupnormad_forward
-            comfy_samplers.sampling_function = orig_sampling_function
-            comfy_sample.prepare_mask = orig_prepare_mask
-            # reapply previous beta schedule
-            if orig_beta_cache is not None:
-                orig_beta_cache.use_cached_beta_schedule_and_clean(model)
+            del latents
+            del noise
             # reset global state
             ADGS.reset()
-            ##############################################
-    return animatediff_sample
+            # restore injected functions
+            function_injections.restore_functions(model)
+            del function_injections
+    return motion_sample
 
 
-def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
+
+def sliding_sampling_function(model, x, timestep, uncond, cond, cond_scale, model_options={}, seed=None):
         def get_area_and_mult(conds, x_in, timestep_in):
             area = (x_in.shape[2], x_in.shape[3], 0, 0)
             strength = 1.0
@@ -346,7 +416,7 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
 
             return out
 
-        def calc_cond_uncond_batch(model_function, cond, uncond, x_in, timestep, max_total_area, model_options):
+        def calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
             out_cond = torch.zeros_like(x_in)
             out_count = torch.ones_like(x_in) * 1e-37
 
@@ -382,9 +452,11 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                 to_batch_temp.reverse()
                 to_batch = to_batch_temp[:1]
 
+                free_memory = model_management.get_free_memory(x_in.device)
                 for i in range(1, len(to_batch_temp) + 1):
                     batch_amount = to_batch_temp[:len(to_batch_temp)//i]
-                    if (len(batch_amount) * first_shape[0] * first_shape[2] * first_shape[3] < max_total_area):
+                    input_shape = [len(batch_amount) * first_shape[0]] + list(first_shape)[1:]
+                    if model.memory_required(input_shape) < free_memory:
                         to_batch = batch_amount
                         break
 
@@ -429,13 +501,16 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                     else:
                         transformer_options["patches"] = patches
 
-                transformer_options["cond_or_uncond"] = cond_or_uncond[:]
+                transformer_options["cond_or_uncond"] = cond_or_uncond
+                transformer_options["sigmas"] = timestep
+                transformer_options["ad_params"] = ADGS.create_exposed_params()
+
                 c['transformer_options'] = transformer_options
 
                 if 'model_function_wrapper' in model_options:
-                    output = model_options['model_function_wrapper'](model_function, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
+                    output = model_options['model_function_wrapper'](model.apply_model, {"input": input_x, "timestep": timestep_, "c": c, "cond_or_uncond": cond_or_uncond}).chunk(batch_chunks)
                 else:
-                    output = model_function(input_x, timestep_, **c).chunk(batch_chunks)
+                    output = model.apply_model(input_x, timestep_, **c).chunk(batch_chunks)
                 del input_x
 
                 for o in range(batch_chunks):
@@ -452,19 +527,19 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
             out_uncond /= out_uncond_count
             del out_uncond_count
             return out_cond, out_uncond
-        
+
         # sliding_calc_cond_uncond_batch inspired by ashen's initial hack for 16-frame sliding context:
         # https://github.com/comfyanonymous/ComfyUI/compare/master...ashen-sensored:ComfyUI:master
-        def sliding_calc_cond_uncond_batch(model_function, cond, uncond, x_in, timestep, max_total_area, model_options):
+        def sliding_calc_cond_uncond_batch(model, cond, uncond, x_in, timestep, model_options):
             # get context scheduler
             context_scheduler = get_context_scheduler(ADGS.context_schedule)
             # figure out how input is split
-            axes_factor = x.size(0)//ADGS.video_length
+            axes_factor = x_in.size(0)//ADGS.video_length
 
             # prepare final cond, uncond, and out_count
-            cond_final = torch.zeros_like(x)
-            uncond_final = torch.zeros_like(x)
-            out_count_final = torch.zeros((x.shape[0], 1, 1, 1), device=x.device)
+            cond_final = torch.zeros_like(x_in)
+            uncond_final = torch.zeros_like(x_in)
+            out_count_final = torch.zeros((x_in.shape[0], 1, 1, 1), device=x_in.device)
 
             def prepare_control_objects(control: ControlBase, full_idxs: list[int]):
                 if control.previous_controlnet is not None:
@@ -485,7 +560,7 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                             cond_item = actual_cond[key]
                             if isinstance(cond_item, Tensor):
                                 # check that tensor is the expected length - x.size(0)
-                                if cond_item.size(0) == x.size(0):
+                                if cond_item.size(0) == x_in.size(0):
                                     # if so, it's subsetting time - tell controls the expected indeces so they can handle them
                                     actual_cond_item = cond_item[full_idxs]
                                     resized_actual_cond[key] = actual_cond_item
@@ -506,11 +581,11 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
                                 # when in dictionary, look for tensors and CONDCrossAttn [comfy/conds.py] (has cond attr that is a tensor)
                                 for cond_key, cond_value in new_cond_item.items():
                                     if isinstance(cond_value, Tensor):
-                                        if cond_value.size(0) == x.size(0):
+                                        if cond_value.size(0) == x_in.size(0):
                                             new_cond_item[cond_key] = cond_value[full_idxs]
                                     # if has cond that is a Tensor, check if needs to be subset
                                     elif hasattr(cond_value, "cond") and isinstance(cond_value.cond, Tensor):
-                                        if cond_value.cond.size(0) == x.size(0):
+                                        if cond_value.cond.size(0) == x_in.size(0):
                                             new_cond_item[cond_key] = cond_value._copy_with(cond_value.cond[full_idxs])
                                 resized_actual_cond[key] = new_cond_item
                             else:
@@ -523,19 +598,20 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
             # perform calc_cond_uncond_batch per context window
             for ctx_idxs in context_scheduler(ADGS.current_step, ADGS.total_steps, ADGS.video_length, ADGS.context_frames, ADGS.context_stride, ADGS.context_overlap, ADGS.closed_loop):
                 ADGS.sub_idxs = ctx_idxs
-                ADGS.motion_module.set_sub_idxs(ADGS.sub_idxs)  
+                ADGS.params.sub_idxs = ADGS.sub_idxs
+                ADGS.motion_model.model.set_sub_idxs(ADGS.sub_idxs)
                 # account for all portions of input frames
                 full_idxs = []
                 for n in range(axes_factor):
                     for ind in ctx_idxs:
                         full_idxs.append((ADGS.video_length*n)+ind)
                 # get subsections of x, timestep, cond, uncond, cond_concat
-                sub_x = x[full_idxs]
+                sub_x = x_in[full_idxs]
                 sub_timestep = timestep[full_idxs]
                 sub_cond = get_resized_cond(cond, full_idxs) if cond is not None else None
                 sub_uncond = get_resized_cond(uncond, full_idxs) if uncond is not None else None
 
-                sub_cond_out, sub_uncond_out = calc_cond_uncond_batch(model_function, sub_cond, sub_uncond, sub_x, sub_timestep, max_total_area, model_options)
+                sub_cond_out, sub_uncond_out = calc_cond_uncond_batch(model, sub_cond, sub_uncond, sub_x, sub_timestep, model_options)
 
                 cond_final[full_idxs] += sub_cond_out
                 uncond_final[full_idxs] += sub_uncond_out
@@ -544,18 +620,19 @@ def sliding_sampling_function(model_function, x, timestep, uncond, cond, cond_sc
             # normalize cond and uncond via division by context usage counts
             cond_final /= out_count_final
             uncond_final /= out_count_final
+            del out_count_final
             return cond_final, uncond_final
 
-        max_total_area = model_management.maximum_batch_area()
+
         if math.isclose(cond_scale, 1.0):
             uncond = None
 
         if not ADGS.is_using_sliding_context():
-            cond, uncond = calc_cond_uncond_batch(model_function, cond, uncond, x, timestep, max_total_area, model_options)
+            cond, uncond = calc_cond_uncond_batch(model, cond, uncond, x, timestep, model_options)
         else:
-            cond, uncond = sliding_calc_cond_uncond_batch(model_function, cond, uncond, x, timestep, max_total_area, model_options)
+            cond, uncond = sliding_calc_cond_uncond_batch(model, cond, uncond, x, timestep, model_options)
         if "sampler_cfg_function" in model_options:
-            args = {"cond": x - cond, "uncond": x - uncond, "cond_scale": cond_scale, "timestep": timestep, "input": x}
+            args = {"cond": x - cond, "uncond": x - uncond, "cond_scale": cond_scale, "timestep": timestep, "input": x, "sigma": timestep}
             return x - model_options["sampler_cfg_function"](args)
         else:
             return uncond + (cond - uncond) * cond_scale
