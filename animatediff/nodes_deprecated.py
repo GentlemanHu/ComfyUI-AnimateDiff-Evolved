@@ -31,6 +31,7 @@ class AnimateDiffLoader_Deprecated:
                 "unlimited_area_hack": ("BOOLEAN", {"default": False},),
                 "beta_schedule": (BetaSchedules.get_alias_list_with_first_element(BetaSchedules.SQRT_LINEAR),),
             },
+            "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated"})},
         }
 
     RETURN_TYPES = ("MODEL", "LATENT")
@@ -87,6 +88,7 @@ class AnimateDiffLoaderAdvanced_Deprecated:
                 "closed_loop": ("BOOLEAN", {"default": False},),
                 "beta_schedule": (BetaSchedules.get_alias_list_with_first_element(BetaSchedules.SQRT_LINEAR),),
             },
+            "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated"})},
         }
 
     RETURN_TYPES = ("MODEL", "LATENT")
@@ -167,6 +169,7 @@ class AnimateDiffCombine_Deprecated:
                 "pingpong": ("BOOLEAN", {"default": False}),
                 "save_image": ("BOOLEAN", {"default": True}),
             },
+            "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated. Use VHS Video Combine"})},
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
@@ -292,6 +295,7 @@ class AnimateDiffModelSettings:
             },
             "optional": {
                 "mask_motion_scale": ("MASK",),
+                "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated"})},
             }
         }
     
@@ -320,6 +324,7 @@ class AnimateDiffModelSettingsSimple:
                 "mask_motion_scale": ("MASK",),
                 "min_motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
                 "max_motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
+                "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated"})},
             }
         }
     
@@ -358,6 +363,7 @@ class AnimateDiffModelSettingsAdvanced:
                 "mask_motion_scale": ("MASK",),
                 "min_motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
                 "max_motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
+                "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated"})},
             }
         }
     
@@ -412,6 +418,7 @@ class AnimateDiffModelSettingsAdvancedAttnStrengths:
                 "mask_motion_scale": ("MASK",),
                 "min_motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
                 "max_motion_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "step": 0.001}),
+                "optional": {"deprecation_warning": ("ADEWARN", {"text": "Deprecated"})},
             }
         }
     
