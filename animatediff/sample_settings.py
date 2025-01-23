@@ -42,9 +42,10 @@ class NoiseLayerType:
 class NoiseApplication:
     ADD = "add"
     ADD_WEIGHTED = "add_weighted"
+    NORMALIZED_SUM = "normalized_sum"
     REPLACE = "replace"
     
-    LIST = [ADD, ADD_WEIGHTED, REPLACE]
+    LIST = [ADD, ADD_WEIGHTED, NORMALIZED_SUM, REPLACE]
 
 
 class NoiseNormalize:
@@ -170,13 +171,33 @@ class NoiseLayerAdd(NoiseLayer):
 class NoiseLayerAddWeighted(NoiseLayerAdd):
     def __init__(self, noise_type: str, batch_offset: int, seed_gen_override: str, seed_offset: int, seed_override: int=None, mask: Tensor=None,
                  noise_weight=1.0, balance_multiplier=1.0):
-        super().__init__(noise_type, batch_offset, seed_gen_override, seed_offset, seed_override, mask, noise_weight)
+        super().__init__(noise_type, batch_offset, seed_gen_override, seed_offset, seed_override, mask)
+        self.noise_weight = noise_weight
         self.balance_multiplier = balance_multiplier
         self.application = NoiseApplication.ADD_WEIGHTED
 
     def apply_layer_noise(self, new_noise: Tensor, old_noise: Tensor) -> Tensor:
         noise_mask = self.get_noise_mask(old_noise)
         return (1-noise_mask)*old_noise + noise_mask*(old_noise * (1.0-(self.noise_weight*self.balance_multiplier)) + new_noise * self.noise_weight)
+
+
+class NoiseLayerNormalizedSum(NoiseLayer):
+    def __init__(self, noise_type: str, batch_offset: int, seed_gen_override: str, seed_offset: int, seed_override: int=None, mask: Tensor=None,
+                 noise_weight=1.0):
+        super().__init__(noise_type, batch_offset, seed_gen_override, seed_offset, seed_override, mask)
+        self.noise_weight = noise_weight
+        self.application = NoiseApplication.NORMALIZED_SUM
+
+    def apply_layer_noise(self, new_noise: Tensor, old_noise: Tensor) -> Tensor:
+        noise_mask = self.get_noise_mask(old_noise)
+        weight_old = 1.0 - self.noise_weight
+        weight_new = self.noise_weight
+        
+        norm_factor = (weight_old**2 + weight_new**2)**0.5
+        weight_old /= norm_factor
+        weight_new /= norm_factor
+
+        return (1 - noise_mask) * old_noise + noise_mask * (weight_old * old_noise + weight_new * new_noise)
 
 
 class NoiseLayerGroup:
@@ -612,9 +633,9 @@ class CustomCFGKeyframe:
     
     def get_effective_guarantee_steps(self, max_sigma: torch.Tensor):
         '''If keyframe starts before current sampling range (max_sigma), treat as 0.'''
-        if self.start_t > max_sigma:
-            return 0
-        return self.guarantee_steps
+        if torch.allclose(self.start_t, max_sigma) or self.start_t < max_sigma:
+            return self.guarantee_steps
+        return 0
 
     def clone(self):
         c = CustomCFGKeyframe(cfg_multival=self.cfg_multival,
@@ -664,7 +685,11 @@ class CustomCFGKeyframeGroup:
     
     def initialize_timesteps(self, model: BaseModel):
         for keyframe in self.keyframes:
-            keyframe.start_t = model.model_sampling.percent_to_sigma(keyframe.start_percent)
+            to_assign = torch.tensor(model.model_sampling.percent_to_sigma(keyframe.start_percent), device=model.model_sampling.sigma_max.device)
+            if keyframe.start_percent == 0.0 and to_assign > model.model_sampling.sigma_max:
+                keyframe.start_t = model.model_sampling.sigma_max
+            else:
+                keyframe.start_t = to_assign
     
     def prepare_current_keyframe(self, t: Tensor, transformer_options: dict[str, Tensor]):
         curr_t: float = t[0]
